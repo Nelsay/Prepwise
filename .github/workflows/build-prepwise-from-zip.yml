@@ -3,14 +3,21 @@ name: Build Signed Prepwise Android from ZIP
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
     paths:
-      - "Prepwise-Android-source.zip"
-      - ".github/workflows/build-prepwise-from-zip.yml"
+      - 'Prepwise-Android-source.zip'
+      - '.github/workflows/build-prepwise-from-zip.yml'
+
+concurrency:
+  group: prepwise-signed-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
+    name: Verify and build signed Prepwise APK
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout repository
@@ -20,7 +27,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -30,47 +37,92 @@ jobs:
         run: |
           set -euo pipefail
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+          sdkmanager 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
 
       - name: Set up compatible Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.11.1"
+          gradle-version: '8.11.1'
+          cache-read-only: false
 
-      - name: Extract Prepwise source ZIP
+      - name: Validate and extract Prepwise source ZIP
         id: source
         shell: bash
         run: |
           set -euo pipefail
-
-          ZIP_FILE="Prepwise-Android-source.zip"
-          if [[ ! -f "$ZIP_FILE" ]]; then
-            echo "Expected $ZIP_FILE in the repository root."
-            exit 1
-          fi
-
+          ZIP='Prepwise-Android-source.zip'
+          test -f "$ZIP" || { echo "ERROR: $ZIP must be in the repository root."; exit 1; }
+          unzip -t "$ZIP" >/dev/null
           rm -rf "$RUNNER_TEMP/prepwise-src"
           mkdir -p "$RUNNER_TEMP/prepwise-src"
-          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/prepwise-src"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/prepwise-src"
 
-          SETTINGS_FILE="$(find "$RUNNER_TEMP/prepwise-src" -type f -name settings.gradle.kts -print -quit)"
-          if [[ -z "$SETTINGS_FILE" ]]; then
-            echo "settings.gradle.kts was not found inside $ZIP_FILE"
+          SETTINGS="$(find "$RUNNER_TEMP/prepwise-src" -type f -name settings.gradle.kts -print -quit)"
+          test -n "$SETTINGS" || { echo 'ERROR: settings.gradle.kts not found in ZIP.'; exit 1; }
+          PROJECT_DIR="$(dirname "$SETTINGS")"
+
+          test -f "$PROJECT_DIR/app/build.gradle.kts" || { echo 'ERROR: app/build.gradle.kts missing.'; exit 1; }
+          test -f "$PROJECT_DIR/app/google-services.json" || { echo 'ERROR: app/google-services.json missing.'; exit 1; }
+          test -f "$PROJECT_DIR/signing/prepwise-update.jks" || { echo 'ERROR: permanent Prepwise update key missing.'; exit 1; }
+          test -f "$PROJECT_DIR/app/src/main/res/values/font_certs.xml" || { echo 'ERROR: Google Fonts certificate resource missing.'; exit 1; }
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Prepwise project: $PROJECT_DIR"
+
+      - name: Preflight known build failures and required features
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          ROOT="$PROJECT_DIR/build.gradle.kts"
+          APP="$PROJECT_DIR/app/build.gradle.kts"
+          THEME="$PROJECT_DIR/app/src/main/java/com/nelsay/prepwise/ui/theme/Theme.kt"
+          SCREENS="$PROJECT_DIR/app/src/main/java/com/nelsay/prepwise/ui/screens/Screens.kt"
+          AI="$PROJECT_DIR/app/src/main/java/com/nelsay/prepwise/ai/CoachClient.kt"
+          AUTH="$PROJECT_DIR/app/src/main/java/com/nelsay/prepwise/auth/GoogleAuthManager.kt"
+          MAIN="$PROJECT_DIR/app/src/main/java/com/nelsay/prepwise/MainActivity.kt"
+
+          # Failure 1: Firebase Auth currently ships Kotlin 2.3 metadata.
+          grep -q 'org.jetbrains.kotlin.android.*2.3.20' "$ROOT" || { echo 'ERROR: Kotlin 2.3.20 Android plugin pin missing.'; exit 1; }
+          grep -q 'org.jetbrains.kotlin.plugin.compose.*2.3.20' "$ROOT" || { echo 'ERROR: Kotlin 2.3.20 Compose plugin pin missing.'; exit 1; }
+
+          # Failure 2: Kotlin 2.3 rejects the old kotlinOptions/jvmTarget String DSL.
+          if grep -R --include='*.gradle.kts' -n 'kotlinOptions' "$PROJECT_DIR"; then
+            echo 'ERROR: old kotlinOptions DSL is still present.'
+            exit 1
+          fi
+          grep -q 'compilerOptions' "$APP" || { echo 'ERROR: compilerOptions DSL missing.'; exit 1; }
+          grep -q 'JvmTarget.JVM_17' "$APP" || { echo 'ERROR: JVM 17 compiler target missing.'; exit 1; }
+
+          # Failure 3: downloadable Inter/Poppins fonts must use the app R.array cert resource.
+          grep -q 'certificates = R.array.com_google_android_gms_fonts_certs' "$THEME" || { echo 'ERROR: app font certificate reference missing.'; exit 1; }
+          grep -q 'GoogleFont("Inter")' "$THEME" || { echo 'ERROR: Inter heading font missing.'; exit 1; }
+          grep -q 'GoogleFont("Poppins")' "$THEME" || { echo 'ERROR: Poppins body font missing.'; exit 1; }
+
+          # Visual/UX correction requested for this build.
+          grep -q 'PrepwiseThemeMode.DARK' "$THEME" || { echo 'ERROR: dark-first theme missing.'; exit 1; }
+          grep -q 'background = PureBlack' "$THEME" || { echo 'ERROR: Catalyst-style dark canvas missing.'; exit 1; }
+          grep -q 'fun SettingsScreen' "$SCREENS" || { echo 'ERROR: Settings screen missing.'; exit 1; }
+          grep -q 'AiProvider.entries' "$SCREENS" || { echo 'ERROR: AI provider selector missing.'; exit 1; }
+          grep -q 'OPENAI("OpenAI")' "$AI" || { echo 'ERROR: OpenAI provider missing.'; exit 1; }
+          grep -q 'GEMINI("Gemini")' "$AI" || { echo 'ERROR: Gemini provider missing.'; exit 1; }
+          grep -q 'AndroidKeyStore' "$AI" || { echo 'ERROR: encrypted API-key storage missing.'; exit 1; }
+          grep -q 'fun signOut' "$AUTH" || { echo 'ERROR: Google/Firebase logout missing.'; exit 1; }
+          grep -q 'fun logout' "$MAIN" || { echo 'ERROR: Prepwise logout action missing.'; exit 1; }
+          grep -q 'MaterialTheme.colorScheme.background' "$SCREENS" || { echo 'ERROR: coherent themed screen backgrounds missing.'; exit 1; }
+
+          # Regression caught while adding provider settings: all coach/grader calls share vm.ai.
+          if grep -R -n 'CoachClient()' "$PROJECT_DIR/app/src/main/java"; then
+            echo 'ERROR: context-less CoachClient() regression found.'
             exit 1
           fi
 
-          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
-          test -f "$PROJECT_DIR/app/google-services.json" || {
-            echo "Bundled app/google-services.json is missing."
-            exit 1
-          }
-          test -f "$PROJECT_DIR/signing/prepwise-update.jks" || {
-            echo "Bundled Prepwise update signing key is missing."
-            exit 1
-          }
+          # Firebase package must match the Android package registered for Prepwise.
+          grep -q 'com.nelsay.prepwise' "$PROJECT_DIR/app/google-services.json" || { echo 'ERROR: Firebase package mismatch.'; exit 1; }
+          grep -q 'applicationId = "com.nelsay.prepwise"' "$APP" || { echo 'ERROR: Android applicationId mismatch.'; exit 1; }
 
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "Using Android project: $PROJECT_DIR"
+          echo 'Prepwise preflight passed.'
 
       - name: Write local Android configuration
         shell: bash
@@ -80,25 +132,24 @@ jobs:
         run: |
           set -euo pipefail
           VERSION_CODE="$(date +%s)"
-          cat > "$PROJECT_DIR/local.properties" <<EOF2
+          cat > "$PROJECT_DIR/local.properties" <<EOF
           sdk.dir=$ANDROID_HOME
           COACH_ENDPOINT=$COACH_ENDPOINT
           VERSION_CODE=$VERSION_CODE
-          VERSION_NAME=1.0.$VERSION_CODE
-          EOF2
+          VERSION_NAME=1.1.$VERSION_CODE
+          EOF
           echo "Prepwise versionCode: $VERSION_CODE"
 
-      - name: Verify Prepwise update certificate
+      - name: Verify permanent Prepwise update certificate
         shell: bash
         env:
           PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
         run: |
           set -euo pipefail
-          keytool -list -v \
-            -keystore "$PROJECT_DIR/signing/prepwise-update.jks" \
-            -storepass android \
-            -alias prepwise-update \
-            -keypass android | grep -E "SHA1:|SHA256:"
+          CERT="$(keytool -list -v -keystore "$PROJECT_DIR/signing/prepwise-update.jks" -storepass android -alias prepwise-update -keypass android)"
+          echo "$CERT" | grep -F 'SHA1: 8E:A8:1F:DF:A1:48:7C:C7:B2:FE:CE:1D:74:6B:9A:8A:A8:8E:01:AA'
+          echo "$CERT" | grep -F 'SHA256: EA:42:05:B9:AF:D3:79:6F:B8:EF:50:9A:A0:B6:95:FE:1A:39:F3:20:28:AC:D4:63:9A:CF:FE:73:81:E4:4E:C1'
+          echo 'Permanent update certificate verified.'
 
       - name: Build signed release APK
         shell: bash
@@ -108,24 +159,26 @@ jobs:
           set -euo pipefail
           gradle --no-daemon -p "$PROJECT_DIR" :app:assembleRelease --stacktrace
 
-      - name: Stage signed APK
+      - name: Verify APK signature and stage artifact
         shell: bash
         env:
           PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
         run: |
           set -euo pipefail
           APK="$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk"
-          if [[ ! -f "$APK" ]]; then
-            echo "Signed release APK not found: $APK"
-            exit 1
-          fi
-          cp "$APK" "$RUNNER_TEMP/Prepwise-signed.apk"
-          sha256sum "$RUNNER_TEMP/Prepwise-signed.apk"
+          test -f "$APK" || { echo "ERROR: signed release APK not found at $APK"; exit 1; }
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+          mkdir -p "$RUNNER_TEMP/prepwise-output"
+          cp "$APK" "$RUNNER_TEMP/prepwise-output/Prepwise-signed.apk"
+          sha256sum "$RUNNER_TEMP/prepwise-output/Prepwise-signed.apk" \
+            > "$RUNNER_TEMP/prepwise-output/Prepwise-signed.apk.sha256"
 
       - name: Upload signed Prepwise APK
         uses: actions/upload-artifact@v4
         with:
           name: Prepwise-signed-apk
-          path: ${{ runner.temp }}/Prepwise-signed.apk
+          path: |
+            ${{ runner.temp }}/prepwise-output/Prepwise-signed.apk
+            ${{ runner.temp }}/prepwise-output/Prepwise-signed.apk.sha256
           if-no-files-found: error
           retention-days: 30
