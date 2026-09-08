@@ -69,6 +69,28 @@ jobs:
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
           echo "Prepwise project: $PROJECT_DIR"
 
+      - name: Apply compatibility hotfixes to extracted source
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          MAIN="$PROJECT_DIR/app/src/main/java/com/nelsay/prepwise/MainActivity.kt"
+          SCREENS="$PROJECT_DIR/app/src/main/java/com/nelsay/prepwise/ui/screens/Screens.kt"
+
+          # Kotlin properties already generate JVM setters named setThemeMode/setAccent.
+          # Rename our explicit functions so they cannot clash with those generated setters.
+          sed -i 's/fun setThemeMode(mode: PrepwiseThemeMode)/fun updateThemeMode(mode: PrepwiseThemeMode)/' "$MAIN"
+          sed -i 's/fun setAccent(value: PrepwiseAccent)/fun updateAccent(value: PrepwiseAccent)/' "$MAIN"
+          sed -i 's/vm\.setThemeMode(mode)/vm.updateThemeMode(mode)/g' "$SCREENS"
+          sed -i 's/vm\.setAccent(choice)/vm.updateAccent(choice)/g' "$SCREENS"
+
+          ! grep -q 'fun setThemeMode(mode: PrepwiseThemeMode)' "$MAIN"
+          ! grep -q 'fun setAccent(value: PrepwiseAccent)' "$MAIN"
+          grep -q 'fun updateThemeMode(mode: PrepwiseThemeMode)' "$MAIN"
+          grep -q 'fun updateAccent(value: PrepwiseAccent)' "$MAIN"
+          echo 'Setter-signature clash hotfix applied.'
+
       - name: Preflight known build failures and required features
         shell: bash
         env:
@@ -82,6 +104,12 @@ jobs:
           AI="$PROJECT_DIR/app/src/main/java/com/nelsay/prepwise/ai/CoachClient.kt"
           AUTH="$PROJECT_DIR/app/src/main/java/com/nelsay/prepwise/auth/GoogleAuthManager.kt"
           MAIN="$PROJECT_DIR/app/src/main/java/com/nelsay/prepwise/MainActivity.kt"
+
+          # Failure 0: explicit setters must not collide with mutableState property setters.
+          ! grep -q 'fun setThemeMode(mode: PrepwiseThemeMode)' "$MAIN" || { echo 'ERROR: setThemeMode JVM signature clash remains.'; exit 1; }
+          ! grep -q 'fun setAccent(value: PrepwiseAccent)' "$MAIN" || { echo 'ERROR: setAccent JVM signature clash remains.'; exit 1; }
+          grep -q 'fun updateThemeMode(mode: PrepwiseThemeMode)' "$MAIN" || { echo 'ERROR: updateThemeMode function missing.'; exit 1; }
+          grep -q 'fun updateAccent(value: PrepwiseAccent)' "$MAIN" || { echo 'ERROR: updateAccent function missing.'; exit 1; }
 
           # Failure 1: Firebase Auth currently ships Kotlin 2.3 metadata.
           grep -q 'org.jetbrains.kotlin.android.*2.3.20' "$ROOT" || { echo 'ERROR: Kotlin 2.3.20 Android plugin pin missing.'; exit 1; }
