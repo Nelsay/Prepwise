@@ -1,0 +1,131 @@
+name: Build Signed Prepwise Android from ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - "Prepwise-Android-source.zip"
+      - ".github/workflows/build-prepwise-from-zip.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android API 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+
+      - name: Set up compatible Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Extract Prepwise source ZIP
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="Prepwise-Android-source.zip"
+          if [[ ! -f "$ZIP_FILE" ]]; then
+            echo "Expected $ZIP_FILE in the repository root."
+            exit 1
+          fi
+
+          rm -rf "$RUNNER_TEMP/prepwise-src"
+          mkdir -p "$RUNNER_TEMP/prepwise-src"
+          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/prepwise-src"
+
+          SETTINGS_FILE="$(find "$RUNNER_TEMP/prepwise-src" -type f -name settings.gradle.kts -print -quit)"
+          if [[ -z "$SETTINGS_FILE" ]]; then
+            echo "settings.gradle.kts was not found inside $ZIP_FILE"
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+          test -f "$PROJECT_DIR/app/google-services.json" || {
+            echo "Bundled app/google-services.json is missing."
+            exit 1
+          }
+          test -f "$PROJECT_DIR/signing/prepwise-update.jks" || {
+            echo "Bundled Prepwise update signing key is missing."
+            exit 1
+          }
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Using Android project: $PROJECT_DIR"
+
+      - name: Write local Android configuration
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+          COACH_ENDPOINT: ${{ secrets.COACH_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          VERSION_CODE="$(date +%s)"
+          cat > "$PROJECT_DIR/local.properties" <<EOF2
+          sdk.dir=$ANDROID_HOME
+          COACH_ENDPOINT=$COACH_ENDPOINT
+          VERSION_CODE=$VERSION_CODE
+          VERSION_NAME=1.0.$VERSION_CODE
+          EOF2
+          echo "Prepwise versionCode: $VERSION_CODE"
+
+      - name: Verify Prepwise update certificate
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          keytool -list -v \
+            -keystore "$PROJECT_DIR/signing/prepwise-update.jks" \
+            -storepass android \
+            -alias prepwise-update \
+            -keypass android | grep -E "SHA1:|SHA256:"
+
+      - name: Build signed release APK
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          gradle -p "$PROJECT_DIR" :app:assembleRelease --stacktrace
+
+      - name: Stage signed APK
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          APK="$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk"
+          if [[ ! -f "$APK" ]]; then
+            echo "Signed release APK not found: $APK"
+            exit 1
+          fi
+          cp "$APK" "$RUNNER_TEMP/Prepwise-signed.apk"
+          sha256sum "$RUNNER_TEMP/Prepwise-signed.apk"
+
+      - name: Upload signed Prepwise APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Prepwise-signed-apk
+          path: ${{ runner.temp }}/Prepwise-signed.apk
+          if-no-files-found: error
+          retention-days: 30
