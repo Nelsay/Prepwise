@@ -140,6 +140,16 @@ jobs:
           grep -q 'fun logout' "$MAIN" || { echo 'ERROR: Prepwise logout action missing.'; exit 1; }
           grep -q 'MaterialTheme.colorScheme.background' "$SCREENS" || { echo 'ERROR: coherent themed screen backgrounds missing.'; exit 1; }
 
+          # Navigation / layout regressions fixed in the Catalyst-style UX pass.
+          grep -q 'BackHandler(enabled = overlayOpen)' "$SCREENS" || { echo 'ERROR: detail-screen Android back handling missing.'; exit 1; }
+          grep -q 'BackHandler(enabled = !overlayOpen && tab != Tab.Home)' "$SCREENS" || { echo 'ERROR: tab-to-home Android back handling missing.'; exit 1; }
+          grep -q 'statusBarsPadding()' "$SCREENS" || { echo 'ERROR: status-bar safe padding missing.'; exit 1; }
+          grep -q 'navigationBarsPadding()' "$SCREENS" || { echo 'ERROR: navigation-bar safe padding missing.'; exit 1; }
+          grep -q 'enum class Tab(val label: String) { Home("Home"), Practice("Practice"), Progress("Progress"), More("More") }' "$SCREENS" || { echo 'ERROR: compact four-destination tab shell missing.'; exit 1; }
+          grep -q 'fun CompactBottomBar' "$SCREENS" || { echo 'ERROR: compact bottom bar missing.'; exit 1; }
+          grep -q 'fun CompactSegmentedControl' "$SCREENS" || { echo 'ERROR: compact segmented controls missing.'; exit 1; }
+          grep -q 'Keep the next step small.' "$SCREENS" || { echo 'ERROR: calm home redesign missing.'; exit 1; }
+
           # Regression caught while adding provider settings: all coach/grader calls share vm.ai.
           if grep -R -n 'CoachClient()' "$PROJECT_DIR/app/src/main/java"; then
             echo 'ERROR: context-less CoachClient() regression found.'
